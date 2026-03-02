@@ -28,6 +28,36 @@ const COMPETITIONS: CompetitionMapItem[] = [
 
 const byCode = new Map(COMPETITIONS.map((competition) => [competition.code, competition]));
 
+const normalizeStatus = (shortStatus?: string) => {
+  switch (shortStatus) {
+    case "1H":
+    case "2H":
+    case "ET":
+    case "P":
+      return "LIVE";
+    case "HT":
+    case "BT":
+      return "PAUSED";
+    case "NS":
+    case "TBD":
+      return "SCHEDULED";
+    case "PST":
+      return "POSTPONED";
+    case "FT":
+    case "AET":
+    case "PEN":
+      return "FINISHED";
+    default:
+      return shortStatus ?? "SCHEDULED";
+  }
+};
+
+type ApiFootballEnvelope<T> = {
+  errors?: Record<string, string> | [];
+  response: T;
+  results?: number;
+};
+
 const apiRequest = async <T>(path: string, params: Record<string, string | number | undefined>) => {
   const url = new URL(`${env.apiFootballBaseUrl}${path}`);
 
@@ -47,7 +77,13 @@ const apiRequest = async <T>(path: string, params: Record<string, string | numbe
     throw new Error(`api-football request failed: ${response.status} ${response.statusText}`);
   }
 
-  return response.json() as Promise<T>;
+  const payload = (await response.json()) as ApiFootballEnvelope<T>;
+
+  if (payload.errors && Object.keys(payload.errors).length > 0) {
+    throw new Error(`api-football payload error: ${JSON.stringify(payload.errors)}`);
+  }
+
+  return payload;
 };
 
 const getSeasonForDate = (date: string, mode: CompetitionMapItem["seasonMode"]) => {
@@ -71,7 +107,7 @@ const normalizeFixture = (fixture: any, leagueOverride?: CompetitionMapItem): No
     competitionName: fixture.league?.name ?? league?.name ?? "Unknown Competition",
     areaName: fixture.league?.country ?? league?.country ?? "Unknown",
     utcDate: fixture.fixture?.date,
-    status: fixture.fixture?.status?.short ?? "SCHEDULED",
+    status: normalizeStatus(fixture.fixture?.status?.short),
     minute: fixture.fixture?.status?.elapsed ?? undefined,
     venue: fixture.fixture?.venue?.name ?? undefined,
     stage: fixture.league?.round ?? undefined,
@@ -122,29 +158,37 @@ export class ApiFootballProvider implements FootballProvider {
     return COMPETITIONS.map(({ apiLeagueId: _apiLeagueId, type: _type, seasonMode: _seasonMode, ...competition }) => competition);
   }
 
-  async getMatchesByDate(dateFrom: string, _dateTo: string, competitionCodes: string[]) {
-    const payloads = await Promise.all(
+  async getMatchesByDate(dateFrom: string, dateTo: string, competitionCodes: string[]) {
+    const allowedIds = new Set(
       competitionCodes
         .map((code) => byCode.get(code))
         .filter((competition): competition is CompetitionMapItem => Boolean(competition))
-        .map(async (competition) => {
-          const season = getSeasonForDate(dateFrom, competition.seasonMode);
-          const payload = await apiRequest<{ response: any[] }>("/fixtures", {
-            date: dateFrom,
-            league: competition.apiLeagueId,
-            season,
-            timezone: "Asia/Dhaka"
-          });
+        .map((competition) => competition.apiLeagueId)
+    );
+    const dates = Array.from(new Set([dateFrom, dateTo]));
+    const responses = await Promise.all(
+      dates.map(async (date) => {
+        const payload = await apiRequest<any[]>("/fixtures", {
+          date,
+          timezone: "Asia/Dhaka"
+        });
 
-          return payload.response.map((fixture) => normalizeFixture(fixture, competition));
-        })
+        return payload.response
+          .filter((fixture) => allowedIds.has(fixture.league?.id))
+          .map((fixture) => normalizeFixture(fixture));
+      })
     );
 
-    return payloads.flat().sort((left, right) => new Date(left.utcDate).getTime() - new Date(right.utcDate).getTime());
+    const uniqueMatches = new Map<string, NormalizedMatch>();
+    for (const match of responses.flat()) {
+      uniqueMatches.set(match.providerMatchId, match);
+    }
+
+    return Array.from(uniqueMatches.values()).sort((left, right) => new Date(left.utcDate).getTime() - new Date(right.utcDate).getTime());
   }
 
   async getLiveMatches(competitionCodes: string[]) {
-    const payload = await apiRequest<{ response: any[] }>("/fixtures", {
+    const payload = await apiRequest<any[]>("/fixtures", {
       live: "all",
       timezone: "Asia/Dhaka"
     });
@@ -169,7 +213,7 @@ export class ApiFootballProvider implements FootballProvider {
       throw new Error(`Unsupported competition code for standings: ${competitionCode}`);
     }
 
-    const payload = await apiRequest<{ response: any[] }>("/standings", {
+    const payload = await apiRequest<any[]>("/standings", {
       league: competition.apiLeagueId,
       season: new Date().getUTCMonth() >= 6 ? new Date().getUTCFullYear() : new Date().getUTCFullYear() - 1
     });
@@ -196,9 +240,9 @@ export class ApiFootballProvider implements FootballProvider {
 
   async getMatchDetails(matchId: string): Promise<MatchDetailPayload | null> {
     const [fixturePayload, statsPayload, eventsPayload] = await Promise.all([
-      apiRequest<{ response: any[] }>("/fixtures", { id: matchId, timezone: "Asia/Dhaka" }),
-      apiRequest<{ response: any[] }>("/fixtures/statistics", { fixture: matchId }),
-      apiRequest<{ response: any[] }>("/fixtures/events", { fixture: matchId })
+      apiRequest<any[]>("/fixtures", { id: matchId, timezone: "Asia/Dhaka" }),
+      apiRequest<any[]>("/fixtures/statistics", { fixture: matchId }),
+      apiRequest<any[]>("/fixtures/events", { fixture: matchId })
     ]);
 
     const fixture = fixturePayload.response?.[0];

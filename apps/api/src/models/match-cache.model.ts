@@ -20,7 +20,8 @@ const teamSchema = new Schema(
 
 const matchCacheSchema = new Schema(
   {
-    providerMatchId: { type: String, required: true, index: true, unique: true },
+    providerMatchId: { type: String, required: true, index: true },
+    sourceProvider: { type: String, required: true, index: true },
     competitionCode: { type: String, required: true, index: true },
     competitionName: { type: String, required: true },
     areaName: { type: String },
@@ -42,5 +43,7 @@ const matchCacheSchema = new Schema(
     timestamps: true
   }
 );
+
+matchCacheSchema.index({ sourceProvider: 1, providerMatchId: 1 }, { unique: true });
 
 export const MatchCacheModel = model("MatchCache", matchCacheSchema);

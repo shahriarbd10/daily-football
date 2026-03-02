@@ -8,10 +8,14 @@ import type { CompetitionDefinition, MatchDetailPayload, NormalizedMatch } from 
 
 const provider = createProvider();
 const memoryCompetitionCache = new Map<string, CompetitionDefinition & { lastFetchedAt: Date }>();
+const currentProvider = env.provider;
+const standingsCache = new Map<string, { fetchedAt: Date; payload: any }>();
+const standingsCacheTtlMs = Math.max(env.cacheTtlSeconds * 1000, 15 * 60 * 1000);
 type CachedMemoryMatch = Omit<NormalizedMatch, "utcDate" | "sourceUpdatedAt"> & {
   utcDate: Date;
   sourceUpdatedAt?: Date;
   lastFetchedAt: Date;
+  sourceProvider: string;
 };
 const memoryMatchCache = new Map<string, CachedMemoryMatch>();
 
@@ -39,8 +43,9 @@ const upsertCompetitions = async (competitions: CompetitionDefinition[]) => {
 const upsertMatches = async (matches: NormalizedMatch[]) => {
   if (!isDatabaseReady()) {
     matches.forEach((match) => {
-      memoryMatchCache.set(match.providerMatchId, {
+      memoryMatchCache.set(`${currentProvider}:${match.providerMatchId}`, {
         ...match,
+        sourceProvider: currentProvider,
         utcDate: new Date(match.utcDate),
         sourceUpdatedAt: match.sourceUpdatedAt ? new Date(match.sourceUpdatedAt) : undefined,
         lastFetchedAt: new Date()
@@ -52,9 +57,10 @@ const upsertMatches = async (matches: NormalizedMatch[]) => {
   await Promise.all(
     matches.map((match) =>
       MatchCacheModel.findOneAndUpdate(
-        { providerMatchId: match.providerMatchId },
+        { sourceProvider: currentProvider, providerMatchId: match.providerMatchId },
         {
           ...match,
+          sourceProvider: currentProvider,
           utcDate: new Date(match.utcDate),
           sourceUpdatedAt: match.sourceUpdatedAt ? new Date(match.sourceUpdatedAt) : undefined,
           lastFetchedAt: new Date()
@@ -77,6 +83,7 @@ export const getMatchesForDate = async (date: string, competitionCodes: string[]
 
   const cached = isDatabaseReady()
     ? await MatchCacheModel.find({
+        sourceProvider: currentProvider,
         competitionCode: { $in: competitionCodes },
         utcDate: { $gte: start, $lte: end }
       })
@@ -85,7 +92,10 @@ export const getMatchesForDate = async (date: string, competitionCodes: string[]
     : Array.from(memoryMatchCache.values())
         .filter(
           (match) =>
-            competitionCodes.includes(match.competitionCode) && match.utcDate >= start && match.utcDate <= end
+            match.sourceProvider === currentProvider &&
+            competitionCodes.includes(match.competitionCode) &&
+            match.utcDate >= start &&
+            match.utcDate <= end
         )
         .sort((left, right) => left.utcDate.getTime() - right.utcDate.getTime());
 
@@ -99,6 +109,7 @@ export const getMatchesForDate = async (date: string, competitionCodes: string[]
 
   const synced = isDatabaseReady()
     ? await MatchCacheModel.find({
+        sourceProvider: currentProvider,
         competitionCode: { $in: competitionCodes },
         utcDate: { $gte: start, $lte: end }
       })
@@ -107,7 +118,10 @@ export const getMatchesForDate = async (date: string, competitionCodes: string[]
     : Array.from(memoryMatchCache.values())
         .filter(
           (match) =>
-            competitionCodes.includes(match.competitionCode) && match.utcDate >= start && match.utcDate <= end
+            match.sourceProvider === currentProvider &&
+            competitionCodes.includes(match.competitionCode) &&
+            match.utcDate >= start &&
+            match.utcDate <= end
         )
         .sort((left, right) => left.utcDate.getTime() - right.utcDate.getTime());
 
@@ -120,6 +134,7 @@ export const getLiveMatches = async (competitionCodes: string[]) => {
 
   return isDatabaseReady()
     ? MatchCacheModel.find({
+        sourceProvider: currentProvider,
         competitionCode: { $in: competitionCodes },
         status: { $in: ["LIVE", "IN_PLAY", "PAUSED"] }
       })
@@ -128,12 +143,24 @@ export const getLiveMatches = async (competitionCodes: string[]) => {
     : Array.from(memoryMatchCache.values())
         .filter(
           (match) =>
-            competitionCodes.includes(match.competitionCode) && ["LIVE", "IN_PLAY", "PAUSED"].includes(match.status)
+            match.sourceProvider === currentProvider &&
+            competitionCodes.includes(match.competitionCode) &&
+            ["LIVE", "IN_PLAY", "PAUSED"].includes(match.status)
         )
         .sort((left, right) => left.utcDate.getTime() - right.utcDate.getTime());
 };
 
-export const getStandings = async (competitionCode: string) => provider.getStandings(competitionCode);
+export const getStandings = async (competitionCode: string) => {
+  const cached = standingsCache.get(`${currentProvider}:${competitionCode}`);
+
+  if (cached && Date.now() - cached.fetchedAt.getTime() < standingsCacheTtlMs) {
+    return cached.payload;
+  }
+
+  const payload = await provider.getStandings(competitionCode);
+  standingsCache.set(`${currentProvider}:${competitionCode}`, { fetchedAt: new Date(), payload });
+  return payload;
+};
 
 const buildDetailFromCachedMatch = (match: NormalizedMatch | CachedMemoryMatch): MatchDetailPayload => ({
   providerMatchId: match.providerMatchId,
@@ -169,11 +196,11 @@ export const getMatchDetails = async (matchId: string) => {
   }
 
   if (isDatabaseReady()) {
-    const match = await MatchCacheModel.findOne({ providerMatchId: matchId }).lean();
+    const match = await MatchCacheModel.findOne({ sourceProvider: currentProvider, providerMatchId: matchId }).lean();
     return match ? buildDetailFromCachedMatch(match as unknown as NormalizedMatch) : null;
   }
 
-  const match = memoryMatchCache.get(matchId);
+  const match = memoryMatchCache.get(`${currentProvider}:${matchId}`);
   return match ? buildDetailFromCachedMatch(match) : null;
 };
 
