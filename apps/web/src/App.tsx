@@ -292,13 +292,21 @@ export default function App() {
   const filterCompetition = (matches: Match[]) =>
     selectedCompetition ? matches.filter((match) => match.competitionCode === selectedCompetition) : matches;
 
-  const previousMatches = sortMatches(filterCompetition(previousData?.matches ?? []), "kickoff-desc");
+  const previousMatches = sortMatches(
+    filterCompetition(previousData?.matches ?? []).filter((match) => finishedStatuses.includes(match.status)),
+    "kickoff-desc"
+  );
   const currentMatches = sortMatches(filterCompetition(currentData?.matches ?? []), sortMode);
-  const nextMatches = sortMatches(filterCompetition(nextData?.matches ?? []), "kickoff-asc");
+  const nextMatches = sortMatches(
+    filterCompetition(nextData?.matches ?? []).filter((match) => upcomingStatuses.includes(match.status)),
+    "kickoff-asc"
+  );
   const groupedPrevious = groupMatches(previousMatches);
   const groupedCurrent = groupMatches(currentMatches);
   const groupedNext = groupMatches(nextMatches);
   const featuredLive = currentData?.liveMatches[0];
+  const selectedCompetitionName =
+    currentData?.competitions.find((competition) => competition.code === selectedCompetition)?.name ?? "All leagues";
   const nextThree = sortMatches(
     [
       ...currentMatches.filter((match) => upcomingStatuses.includes(match.status)),
@@ -309,6 +317,20 @@ export default function App() {
   const standingsRows = standingsExpanded
     ? currentData?.standings.standings ?? []
     : currentData?.standings.standings.slice(0, 8) ?? [];
+
+  useEffect(() => {
+    const availableMatches = [...currentMatches, ...previousMatches, ...nextMatches];
+
+    if (availableMatches.length === 0) {
+      return;
+    }
+
+    const stillVisible = availableMatches.some((match) => match.providerMatchId === selectedMatchId);
+
+    if (!stillVisible) {
+      setSelectedMatchId(availableMatches[0]?.providerMatchId);
+    }
+  }, [selectedCompetition, selectedMatchId, currentMatches, previousMatches, nextMatches]);
 
   return (
     <div className="shell live-shell">
@@ -447,7 +469,7 @@ export default function App() {
 
           <CompetitionGroup
             title="Previous day"
-            subtitle={`${previousMatches.length} matches around ${shiftDhakaDate(date, -1)}`}
+            subtitle={`${selectedCompetitionName} • ${previousMatches.length} matches around ${shiftDhakaDate(date, -1)}`}
             groups={groupedPrevious}
             selectedMatchId={selectedMatchId}
             onSelect={setSelectedMatchId}
@@ -456,7 +478,7 @@ export default function App() {
 
           <CompetitionGroup
             title="Selected day"
-            subtitle={`${currentMatches.length} matches on ${date}`}
+            subtitle={`${selectedCompetitionName} • ${currentMatches.length} matches on ${date}`}
             groups={groupedCurrent}
             selectedMatchId={selectedMatchId}
             onSelect={setSelectedMatchId}
@@ -465,7 +487,7 @@ export default function App() {
 
           <CompetitionGroup
             title="Next day"
-            subtitle={`${nextMatches.length} matches around ${shiftDhakaDate(date, 1)}`}
+            subtitle={`${selectedCompetitionName} • ${nextMatches.length} matches around ${shiftDhakaDate(date, 1)}`}
             groups={groupedNext}
             selectedMatchId={selectedMatchId}
             onSelect={setSelectedMatchId}
