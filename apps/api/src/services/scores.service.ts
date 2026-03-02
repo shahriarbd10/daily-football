@@ -11,6 +11,8 @@ const memoryCompetitionCache = new Map<string, CompetitionDefinition & { lastFet
 const currentProvider = env.provider;
 const standingsCache = new Map<string, { fetchedAt: Date; payload: any }>();
 const standingsCacheTtlMs = Math.max(env.cacheTtlSeconds * 1000, 15 * 60 * 1000);
+const standingsInFlight = new Map<string, Promise<any>>();
+const matchesInFlight = new Map<string, Promise<NormalizedMatch[]>>();
 type CachedMemoryMatch = Omit<NormalizedMatch, "utcDate" | "sourceUpdatedAt"> & {
   utcDate: Date;
   sourceUpdatedAt?: Date;
@@ -20,6 +22,8 @@ type CachedMemoryMatch = Omit<NormalizedMatch, "utcDate" | "sourceUpdatedAt"> & 
 const memoryMatchCache = new Map<string, CachedMemoryMatch>();
 
 const isFresh = (lastFetchedAt: Date) => Date.now() - lastFetchedAt.getTime() < env.cacheTtlSeconds * 1000;
+const isRateLimitError = (error: unknown) =>
+  error instanceof Error && (error.message.includes("429") || error.message.toLowerCase().includes("rate limit"));
 
 const upsertCompetitions = async (competitions: CompetitionDefinition[]) => {
   if (!isDatabaseReady()) {
@@ -80,6 +84,7 @@ export const getCompetitionCatalog = async () => {
 
 export const getMatchesForDate = async (date: string, competitionCodes: string[]) => {
   const { start, end } = getDhakaUtcRange(date);
+  const requestKey = `${currentProvider}:${date}:${competitionCodes.slice().sort().join(",")}`;
 
   const cached = isDatabaseReady()
     ? await MatchCacheModel.find({
@@ -104,8 +109,30 @@ export const getMatchesForDate = async (date: string, competitionCodes: string[]
   }
 
   const { dateFrom, dateTo } = getProviderDateWindow(date);
-  const fresh = await provider.getMatchesByDate(dateFrom, dateTo, competitionCodes);
-  await upsertMatches(fresh);
+  let requestPromise = matchesInFlight.get(requestKey);
+
+  if (!requestPromise) {
+    requestPromise = (async () => {
+      try {
+        return await provider.getMatchesByDate(dateFrom, dateTo, competitionCodes);
+      } finally {
+        matchesInFlight.delete(requestKey);
+      }
+    })();
+
+    matchesInFlight.set(requestKey, requestPromise);
+  }
+
+  try {
+    const fresh = await requestPromise;
+    await upsertMatches(fresh);
+  } catch (error) {
+    if (cached.length > 0 && isRateLimitError(error)) {
+      return cached;
+    }
+
+    throw error;
+  }
 
   const synced = isDatabaseReady()
     ? await MatchCacheModel.find({
@@ -151,15 +178,38 @@ export const getLiveMatches = async (competitionCodes: string[]) => {
 };
 
 export const getStandings = async (competitionCode: string) => {
-  const cached = standingsCache.get(`${currentProvider}:${competitionCode}`);
+  const cacheKey = `${currentProvider}:${competitionCode}`;
+  const cached = standingsCache.get(cacheKey);
 
   if (cached && Date.now() - cached.fetchedAt.getTime() < standingsCacheTtlMs) {
     return cached.payload;
   }
 
-  const payload = await provider.getStandings(competitionCode);
-  standingsCache.set(`${currentProvider}:${competitionCode}`, { fetchedAt: new Date(), payload });
-  return payload;
+  let requestPromise = standingsInFlight.get(cacheKey);
+
+  if (!requestPromise) {
+    requestPromise = (async () => {
+      try {
+        return await provider.getStandings(competitionCode);
+      } finally {
+        standingsInFlight.delete(cacheKey);
+      }
+    })();
+
+    standingsInFlight.set(cacheKey, requestPromise);
+  }
+
+  try {
+    const payload = await requestPromise;
+    standingsCache.set(cacheKey, { fetchedAt: new Date(), payload });
+    return payload;
+  } catch (error) {
+    if (cached && isRateLimitError(error)) {
+      return cached.payload;
+    }
+
+    throw error;
+  }
 };
 
 const buildDetailFromCachedMatch = (match: NormalizedMatch | CachedMemoryMatch): MatchDetailPayload => ({
