@@ -3,6 +3,8 @@ import type {
   CompetitionDefinition,
   FootballProvider,
   MatchDetailPayload,
+  MatchIncident,
+  MatchStat,
   NormalizedMatch,
   StandingsPayload
 } from "./types.js";
@@ -79,6 +81,178 @@ const normalizeMatch = (match: any): NormalizedMatch => ({
   raw: match
 });
 
+const resolveTeamSide = (entry: any, match: any): "home" | "away" => {
+  const teamId = entry?.team?.id ?? entry?.team?.teamId ?? entry?.team?.team?.id;
+
+  if (teamId && teamId === match.homeTeam?.id) {
+    return "home";
+  }
+
+  if (teamId && teamId === match.awayTeam?.id) {
+    return "away";
+  }
+
+  const teamName = String(
+    entry?.team?.name ??
+      entry?.team?.shortName ??
+      entry?.team?.tla ??
+      entry?.team?.team?.name ??
+      ""
+  ).toLowerCase();
+
+  if (teamName) {
+    const homeNames = [match.homeTeam?.name, match.homeTeam?.shortName, match.homeTeam?.tla]
+      .filter(Boolean)
+      .map((value: string) => value.toLowerCase());
+    const awayNames = [match.awayTeam?.name, match.awayTeam?.shortName, match.awayTeam?.tla]
+      .filter(Boolean)
+      .map((value: string) => value.toLowerCase());
+
+    if (homeNames.includes(teamName)) {
+      return "home";
+    }
+
+    if (awayNames.includes(teamName)) {
+      return "away";
+    }
+  }
+
+  return "home";
+};
+
+const buildIncidents = (match: any): MatchIncident[] => {
+  const goals = (match.goals ?? []).map((goal: any) => ({
+    minute: goal.minute ?? 0,
+    type: "goal" as const,
+    team: resolveTeamSide(goal, match),
+    player: goal.scorer?.name ?? goal.person?.name ?? goal.player?.name ?? "Goal",
+    detail: goal.assist?.name ? `Assist: ${goal.assist.name}` : goal.type ?? "Goal"
+  }));
+
+  const cards = (match.bookings ?? []).map((booking: any) => ({
+    minute: booking.minute ?? 0,
+    type: "card" as const,
+    team: resolveTeamSide(booking, match),
+    player: booking.player?.name ?? "Booking",
+    detail: booking.card ?? booking.type ?? "Card"
+  }));
+
+  const substitutions = (match.substitutions ?? []).flatMap((change: any) => {
+    const minute = change.minute ?? 0;
+    const team = resolveTeamSide(change, match);
+    const inPlayer = change.playerIn?.name ?? change.replacement?.name;
+    const outPlayer = change.playerOut?.name ?? change.replaced?.name;
+    const rows: MatchIncident[] = [];
+
+    if (inPlayer) {
+      rows.push({
+        minute,
+        type: "substitution",
+        team,
+        player: inPlayer,
+        detail: outPlayer ? `Substitution in for ${outPlayer}` : "Substitution in"
+      });
+    }
+
+    if (!inPlayer && outPlayer) {
+      rows.push({
+        minute,
+        type: "substitution",
+        team,
+        player: outPlayer,
+        detail: "Substitution out"
+      });
+    }
+
+    return rows;
+  });
+
+  return [...goals, ...cards, ...substitutions].sort((left, right) => left.minute - right.minute);
+};
+
+const normalizeStatValue = (value: unknown): string | number => {
+  if (typeof value === "number" || typeof value === "string") {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return "-";
+  }
+
+  if (typeof value === "object" && "value" in (value as Record<string, unknown>)) {
+    return normalizeStatValue((value as Record<string, unknown>).value);
+  }
+
+  return String(value);
+};
+
+const buildStats = (match: any): MatchStat[] => {
+  const statistics = match.statistics;
+
+  if (!statistics) {
+    return [];
+  }
+
+  if (Array.isArray(statistics)) {
+    if (statistics.length === 2 && Array.isArray(statistics[0]?.statistics) && Array.isArray(statistics[1]?.statistics)) {
+      const homeStats = new Map(
+        statistics[0].statistics.map((entry: any) => [entry.type ?? entry.name ?? entry.label, entry.value ?? "-"])
+      );
+      const awayStats = new Map(
+        statistics[1].statistics.map((entry: any) => [entry.type ?? entry.name ?? entry.label, entry.value ?? "-"])
+      );
+      const labels = Array.from(new Set([...homeStats.keys(), ...awayStats.keys()]))
+        .filter(Boolean)
+        .map((label) => String(label));
+
+      return labels.map((label) => ({
+        label,
+        home: normalizeStatValue(homeStats.get(label)),
+        away: normalizeStatValue(awayStats.get(label))
+      }));
+    }
+
+    return statistics
+      .map((entry: any) => ({
+        label: String(entry.type ?? entry.name ?? entry.label ?? ""),
+        home: normalizeStatValue(entry.home ?? entry.homeTeam ?? entry.value?.home ?? "-"),
+        away: normalizeStatValue(entry.away ?? entry.awayTeam ?? entry.value?.away ?? "-")
+      }))
+      .filter((entry: MatchStat) => Boolean(entry.label));
+  }
+
+  if (typeof statistics === "object") {
+    return Object.entries(statistics).map(([label, value]) => ({
+      label,
+      home: normalizeStatValue((value as any)?.home ?? "-"),
+      away: normalizeStatValue((value as any)?.away ?? "-")
+    }));
+  }
+
+  return [];
+};
+
+const buildSummary = (match: any, incidents: MatchIncident[], stats: MatchStat[]) => {
+  const goalCount = incidents.filter((incident) => incident.type === "goal").length;
+  const cardCount = incidents.filter((incident) => incident.type === "card").length;
+  const substitutionCount = incidents.filter((incident) => incident.type === "substitution").length;
+
+  const parts = [
+    goalCount > 0 ? `${goalCount} goal${goalCount === 1 ? "" : "s"}` : null,
+    cardCount > 0 ? `${cardCount} card${cardCount === 1 ? "" : "s"}` : null,
+    substitutionCount > 0 ? `${substitutionCount} substitution${substitutionCount === 1 ? "" : "s"}` : null,
+    stats.length > 0 ? `${stats.length} tracked stat${stats.length === 1 ? "" : "s"}` : null
+  ].filter(Boolean);
+
+  if (parts.length > 0) {
+    return `Match feed includes ${parts.join(", ")}.`;
+  }
+
+  return match.status === "SCHEDULED"
+    ? "Match is scheduled. Detailed events will appear when the provider publishes them."
+    : "Provider returned the match, but no detailed event feed is available for this fixture yet.";
+};
+
 export class FootballDataProvider implements FootballProvider {
   async getCompetitions() {
     return TOP_COMPETITIONS;
@@ -129,11 +303,14 @@ export class FootballDataProvider implements FootballProvider {
 
   async getMatchDetails(matchId: string): Promise<MatchDetailPayload | null> {
     const payload = await request<any>(`/matches/${matchId}`);
-    const match = payload.match;
+    const match = payload.match ?? payload;
 
     if (!match) {
       return null;
     }
+
+    const incidents = buildIncidents(match);
+    const stats = buildStats(match);
 
     return {
       providerMatchId: String(match.id),
@@ -161,13 +338,15 @@ export class FootballDataProvider implements FootballProvider {
         halfTimeHome: match.score?.halfTime?.home ?? null,
         halfTimeAway: match.score?.halfTime?.away ?? null
       },
-      summary: "Detailed event and statistics coverage depends on the active provider plan.",
-      stats: [
-        { label: "Possession", home: "-", away: "-" },
-        { label: "Shots on target", home: "-", away: "-" },
-        { label: "Expected goals", home: "-", away: "-" }
-      ],
-      incidents: []
+      summary: buildSummary(match, incidents, stats),
+      stats:
+        stats.length > 0
+          ? stats
+          : [
+              { label: "Status", home: match.status ?? "-", away: match.minute ?? "-" },
+              { label: "Half-time", home: match.score?.halfTime?.home ?? "-", away: match.score?.halfTime?.away ?? "-" }
+            ],
+      incidents
     };
   }
 }

@@ -37,3 +37,13 @@ export const getMatchDetails = async (matchId: string) => {
 
   return response.json() as Promise<MatchDetail>;
 };
+
+export const getStandings = async (competitionCode: string) => {
+  const response = await fetch(`${API_BASE_URL}/standings/${competitionCode}`);
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response, "Failed to load standings"));
+  }
+
+  return response.json() as Promise<DashboardPayload["standings"]>;
+};
